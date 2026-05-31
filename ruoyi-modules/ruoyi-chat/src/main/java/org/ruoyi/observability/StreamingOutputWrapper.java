@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 @Slf4j
 public class StreamingOutputWrapper implements StreamingChatModel, ChatModel {
+    public static final String REASONING_PREFIX = "__REASONING__::";
 
     private final StreamingChatModel streamingDelegate;
     private final OutputChannel channel;
@@ -81,13 +82,13 @@ public class StreamingOutputWrapper implements StreamingChatModel, ChatModel {
 
             @Override
             public void onPartialThinking(PartialThinking thinking) {
-                channel.send("[思考] " + thinking.text());
+                channel.send(REASONING_PREFIX + thinking.text());
                 log.debug("【流式思考】{}", thinking.text());
             }
 
             @Override
             public void onPartialThinking(PartialThinking thinking, PartialThinkingContext ctx) {
-                channel.send("[思考] " + thinking.text());
+                channel.send(REASONING_PREFIX + thinking.text());
             }
 
             @Override
@@ -109,6 +110,7 @@ public class StreamingOutputWrapper implements StreamingChatModel, ChatModel {
 //                        + " output=" + usage.outputTokenCount());
                 }
                 log.info("【StreamingOutputWrapper】流式处理完成");
+                channel.complete();
                 future.complete(null);
             }
 
@@ -153,13 +155,13 @@ public class StreamingOutputWrapper implements StreamingChatModel, ChatModel {
 
             @Override
             public void onPartialThinking(PartialThinking thinking) {
-                channel.send("[思考] " + thinking.text());
+                channel.send(REASONING_PREFIX + thinking.text());
                 original.onPartialThinking(thinking);
             }
 
             @Override
             public void onPartialThinking(PartialThinking thinking, PartialThinkingContext ctx) {
-                channel.send("[思考] " + thinking.text());
+                channel.send(REASONING_PREFIX + thinking.text());
                 original.onPartialThinking(thinking, ctx);
             }
 
@@ -182,6 +184,7 @@ public class StreamingOutputWrapper implements StreamingChatModel, ChatModel {
 //                    channel.send("\n[Token统计] input=" + usage.inputTokenCount()
 //                        + " output=" + usage.outputTokenCount());
                 }
+                channel.complete();
                 original.onCompleteResponse(response);
             }
 

@@ -80,6 +80,11 @@ public class ChatRequest {
     private Boolean enableThinking = false;
 
     /**
+     * 是否启用 MCP/内置工具调用（用于接入业务系统数据）
+     */
+    private Boolean enableMcpTools = false;
+
+    /**
      * 对话模型详情
      */
     private ChatModelVo chatModelVo;

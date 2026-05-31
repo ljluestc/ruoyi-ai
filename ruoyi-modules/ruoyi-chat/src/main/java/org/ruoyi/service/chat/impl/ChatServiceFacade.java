@@ -13,9 +13,12 @@ import dev.langchain4j.mcp.client.McpClient;
 import dev.langchain4j.mcp.client.transport.McpTransport;
 import dev.langchain4j.mcp.client.transport.stdio.StdioMcpTransport;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.service.AiServices;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.PartialThinking;
+import dev.langchain4j.model.chat.response.PartialThinkingContext;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.service.tool.ToolProvider;
@@ -112,6 +115,16 @@ public class ChatServiceFacade implements IChatService {
      */
     private static final Map<Object, MessageWindowChatMemory> memoryCache = new ConcurrentHashMap<>();
 
+    interface McpBusinessDataAssistant {
+        @dev.langchain4j.service.SystemMessage("""
+            你是一个企业业务数据智能助手。
+            - 当问题涉及业务数据（如任务数、订单数、工单状态、统计报表）时，优先调用可用工具获取实时数据后再回答。
+            - 若工具返回结构化数据，请先归纳关键结论，再给出简洁说明。
+            - 若工具不可用或数据不足，请明确说明缺失项并给出下一步建议。
+            """)
+        String chat(@dev.langchain4j.service.UserMessage String userMessage);
+    }
+
 
 
     /**
@@ -203,6 +216,10 @@ public class ChatServiceFacade implements IChatService {
 
             return chatRequest.getEmitter();
 
+        }
+        // 处理 MCP/内置工具模式（用于对接业务系统数据）
+        if (Boolean.TRUE.equals(chatRequest.getEnableMcpTools())) {
+            return handleMcpToolMode(chatRequest);
         }
         // 处理思考模式
         if (chatRequest.getEnableThinking()) {
@@ -341,6 +358,79 @@ public class ChatServiceFacade implements IChatService {
                 SseMessageUtils.completeConnection(userId, tokenValue);
             }
         });
+        return chatRequest.getEmitter();
+    }
+
+    /**
+     * 处理 MCP/内置工具模式
+     * 用于将业务系统数据（本地 SQL 工具或远程 MCP 工具）接入聊天能力。
+     */
+    private SseEmitter handleMcpToolMode(ChatRequest chatRequest) {
+        Long userId = chatRequest.getUserId();
+        String tokenValue = chatRequest.getTokenValue();
+        ChatModelVo chatModelVo = chatRequest.getChatModelVo();
+
+        String providerCode = chatModelVo.getProviderCode();
+        AbstractChatService chatService = chatServiceFactory.getOriginalService(providerCode);
+
+        // 使用流式模型包装成 ChatModel，既支持工具调用，又能将 token 实时透传到 SSE
+        StreamingChatModel streamingChatModel = chatService.buildStreamingChatModel(chatModelVo, chatRequest);
+        OutputChannel channel = new OutputChannel();
+        ChatModel wrappedChatModel = new StreamingOutputWrapper(streamingChatModel, channel);
+
+        ToolProvider mcpToolProvider = toolProviderFactory.getAllEnabledMcpToolsProvider();
+        List<Object> builtinTools = toolProviderFactory.getAllBuiltinToolObjects();
+        MessageWindowChatMemory chatMemory = createChatMemory(chatRequest.getSessionId());
+
+        McpBusinessDataAssistant assistant = AiServices.builder(McpBusinessDataAssistant.class)
+            .chatModel(wrappedChatModel)
+            .chatMemory(chatMemory)
+            .toolProvider(mcpToolProvider)
+            .tools(builtinTools.toArray())
+            .build();
+
+        CompletableFuture<Void> drainFuture = CompletableFuture.runAsync(() -> {
+            try {
+                channel.drain(chunk -> {
+                    if (chunk.startsWith(StreamingOutputWrapper.REASONING_PREFIX)) {
+                        String reasoning = chunk.substring(StreamingOutputWrapper.REASONING_PREFIX.length());
+                        SseMessageUtils.sendReasoning(userId, reasoning);
+                    } else {
+                        SseMessageUtils.sendContent(userId, chunk);
+                    }
+                });
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                SseMessageUtils.sendError(userId, "流式输出被中断");
+            } catch (Exception e) {
+                SseMessageUtils.sendError(userId, e.getMessage());
+            }
+        });
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                String result = assistant.chat(chatRequest.getContent());
+                if (StringUtils.isNotBlank(result)) {
+                    chatMessageService.saveChatMessage(
+                        userId,
+                        chatRequest.getSessionId(),
+                        result,
+                        RoleType.ASSISTANT.getName(),
+                        chatRequest.getModel()
+                    );
+                }
+            } catch (Exception e) {
+                log.error("MCP/内置工具模式执行失败", e);
+                SseMessageUtils.sendError(userId, e.getMessage());
+                channel.completeWithError(e);
+            } finally {
+                channel.complete();
+                drainFuture.join();
+                SseMessageUtils.sendDone(userId);
+                SseMessageUtils.completeConnection(userId, tokenValue);
+            }
+        });
+
         return chatRequest.getEmitter();
     }
 
@@ -525,6 +615,19 @@ public class ChatServiceFacade implements IChatService {
             }
 
             @Override
+            public void onPartialThinking(PartialThinking thinking) {
+                if (thinking != null && StringUtils.isNotBlank(thinking.text())) {
+                    SseMessageUtils.sendReasoning(userId, thinking.text());
+                    log.debug("收到推理片段: {}", thinking.text());
+                }
+            }
+
+            @Override
+            public void onPartialThinking(PartialThinking thinking, PartialThinkingContext ctx) {
+                onPartialThinking(thinking);
+            }
+
+            @Override
             public void onCompleteResponse(ChatResponse completeResponse) {
                 try {
                     // 发送完成事件
@@ -583,6 +686,26 @@ public class ChatServiceFacade implements IChatService {
                 // 3. 转发给外部 handler（Workflow 等模块可处理）
                 if (externalHandler != null) {
                     externalHandler.onPartialResponse(partialResponse);
+                }
+            }
+
+            @Override
+            public void onPartialThinking(PartialThinking thinking) {
+                if (thinking != null && StringUtils.isNotBlank(thinking.text())) {
+                    SseMessageUtils.sendReasoning(userId, thinking.text());
+                }
+                if (externalHandler != null) {
+                    externalHandler.onPartialThinking(thinking);
+                }
+            }
+
+            @Override
+            public void onPartialThinking(PartialThinking thinking, PartialThinkingContext ctx) {
+                if (thinking != null && StringUtils.isNotBlank(thinking.text())) {
+                    SseMessageUtils.sendReasoning(userId, thinking.text());
+                }
+                if (externalHandler != null) {
+                    externalHandler.onPartialThinking(thinking, ctx);
                 }
             }
 
