@@ -380,14 +380,27 @@ public class ChatServiceFacade implements IChatService {
 
         ToolProvider mcpToolProvider = toolProviderFactory.getAllEnabledMcpToolsProvider();
         List<Object> builtinTools = toolProviderFactory.getAllBuiltinToolObjects();
-        MessageWindowChatMemory chatMemory = createChatMemory(chatRequest.getSessionId());
+        if (mcpToolProvider == null && (builtinTools == null || builtinTools.isEmpty())) {
+            SseMessageUtils.sendError(userId, "未检测到可用工具，请先启用 MCP 工具或内置工具后再重试");
+            SseMessageUtils.sendDone(userId);
+            SseMessageUtils.completeConnection(userId, tokenValue);
+            return chatRequest.getEmitter();
+        }
 
-        McpBusinessDataAssistant assistant = AiServices.builder(McpBusinessDataAssistant.class)
-            .chatModel(wrappedChatModel)
-            .chatMemory(chatMemory)
-            .toolProvider(mcpToolProvider)
-            .tools(builtinTools.toArray())
-            .build();
+        MessageWindowChatMemory chatMemory = createChatMemory(chatRequest.getSessionId());
+        AiServices<McpBusinessDataAssistant> assistantBuilder = AiServices.builder(McpBusinessDataAssistant.class)
+            .chatModel(wrappedChatModel);
+        if (chatMemory != null) {
+            assistantBuilder = assistantBuilder.chatMemory(chatMemory);
+        }
+        if (mcpToolProvider != null) {
+            assistantBuilder = assistantBuilder.toolProvider(mcpToolProvider);
+        }
+        if (builtinTools != null && !builtinTools.isEmpty()) {
+            assistantBuilder = assistantBuilder.tools(builtinTools.toArray());
+        }
+
+        McpBusinessDataAssistant assistant = assistantBuilder.build();
 
         CompletableFuture<Void> drainFuture = CompletableFuture.runAsync(() -> {
             try {

@@ -1,108 +1,94 @@
 close #300
 close #303
 
-# PR 描述：业务系统数据打通（MCP/内置工具）+ Thinking 流式回传
-## 一、背景与目标
-本 PR 聚焦两个用户问题：
-1. **#300 与业务系统打通数据**：希望在聊天中直接获取业务数据（例如“我今天有多少个任务”），而不仅是通用问答。
-2. **#303 Thinking 过程前端可见**：希望模型推理/思考过程可以像主流 AI 平台一样流式展示到前端。
+# PR 描述：实现业务系统数据打通（MCP/内置工具）并完善 Thinking 流式回传
+## 一、问题背景
+本 PR 解决两个直接需求：
+1. **#300 与业务系统打通数据**：希望聊天可基于业务数据回答问题（例如“我今天有多少个任务”）。
+2. **#303 Thinking 前端展示**：希望模型思考过程可以流式下发到前端显示。
 
-本次改动目标：
-- 在后端提供可开关的工具增强模式，将 **MCP 工具 + 内置工具** 接入聊天链路，支持业务数据查询；
-- 将模型返回的 `partial thinking` 显式转换为 SSE 的 `reasoning` 事件，供前端实时展示。
+## 二、目标
+- 为聊天链路增加可开关的“工具增强模式”，让模型可以调用 MCP 工具和内置工具查询业务数据；
+- 将模型推理片段（thinking）转为 SSE `reasoning` 事件；
+- 保持默认行为兼容，未开启功能时不影响现有对话流程；
+- 增加基础单测，覆盖新增开关与流式通道关键行为。
 
-## 二、变更概览
-### 1) 请求参数扩展（启用业务数据工具模式）
+## 三、实现方案
+### 1) 请求层扩展：新增工具模式开关
 文件：
 - `ruoyi-common/ruoyi-common-chat/src/main/java/org/ruoyi/common/chat/domain/dto/request/ChatRequest.java`
 
-新增字段：
-- `enableMcpTools: Boolean = false`
+改动：
+- 新增 `enableMcpTools` 字段，默认 `false`。
 
-作用：
-- 由前端或调用方按需开启工具增强对话，避免默认行为突变。
+效果：
+- 调用方可按会话/请求显式开启工具增强，不会改变默认聊天路径。
 
-### 2) ChatServiceFacade 增强
+### 2) 聊天编排增强：支持 MCP/内置工具业务数据问答
 文件：
 - `ruoyi-modules/ruoyi-chat/src/main/java/org/ruoyi/service/chat/impl/ChatServiceFacade.java`
 
-#### 2.1 新增 MCP/内置工具模式分支
-- 在 `handleSpecialChatModes(...)` 中新增判断：
-  - `enableMcpTools == true` 时进入 `handleMcpToolMode(...)`。
+核心改动：
+- 在 `handleSpecialChatModes(...)` 中新增 `enableMcpTools` 分支，进入 `handleMcpToolMode(...)`；
+- 新增 `McpBusinessDataAssistant`，通过系统提示词约束“业务数据问题优先走工具”；
+- 使用 `StreamingOutputWrapper + OutputChannel` 实现“工具调用 + 流式输出 + SSE 分发”；
+- 在 drain 逻辑中区分：
+  - 普通 token -> `SseMessageUtils.sendContent(...)`
+  - 推理 token -> `SseMessageUtils.sendReasoning(...)`
 
-#### 2.2 新增 `McpBusinessDataAssistant` 接口
-- 使用 `AiServices` 构建带工具能力的助手；
-- 系统提示词强调“问题涉及业务数据时优先调用工具”。
+本次补充的健壮性处理：
+- 若当前未启用任何 MCP/内置工具，立即返回可读错误并结束 SSE，避免空工具链路下的无意义调用；
+- `AiServices` 构建改为按可用能力条件注入（`chatMemory` / `toolProvider` / `tools`），避免空对象导致构建异常。
 
-#### 2.3 新增 `handleMcpToolMode(...)`
-- 组合能力：
-  - Provider 流式模型；
-  - `ToolProviderFactory#getAllEnabledMcpToolsProvider()`（MCP 工具）；
-  - `ToolProviderFactory#getAllBuiltinToolObjects()`（内置工具，如 SQL 相关工具）；
-  - 会话记忆（`MessageWindowChatMemory`）。
-- 通过 `StreamingOutputWrapper + OutputChannel` 将 AI 输出分流：
-  - 普通内容 -> `SseMessageUtils.sendContent(...)`
-  - 推理内容 -> `SseMessageUtils.sendReasoning(...)`
-- 对话结束后保存助手消息、发送 `done`、关闭连接。
-
-#### 2.4 Thinking 事件流式回传增强
-- 在 `createResponseHandler(...)` 和 `createCombinedHandler(...)` 中补充：
-  - `onPartialThinking(...)`
-  - `onPartialThinking(..., PartialThinkingContext ...)`
-- 行为：
-  - 当模型返回思考片段时，发送 SSE `reasoning` 事件；
-  - 外部 handler 存在时继续透传，保证跨模块兼容。
-
-### 3) StreamingOutputWrapper 增强
+### 3) Thinking 流式输出增强
 文件：
 - `ruoyi-modules/ruoyi-chat/src/main/java/org/ruoyi/observability/StreamingOutputWrapper.java`
+- `ruoyi-modules/ruoyi-chat/src/main/java/org/ruoyi/service/chat/impl/ChatServiceFacade.java`
 
-改动点：
-- 新增常量：`REASONING_PREFIX = "__REASONING__::"`；
-- 对 `onPartialThinking` 统一输出该前缀（供上层识别并转为 reasoning 事件）；
-- 在流式完成回调中显式 `channel.complete()`，保证消费端可正常收尾。
+改动：
+- `StreamingOutputWrapper` 对 `onPartialThinking` 输出统一前缀 `__REASONING__::`；
+- `ChatServiceFacade` 在标准 handler 与组合 handler 中补充 `onPartialThinking` 处理并转发 SSE `reasoning`。
 
-## 三、影响范围
-受影响模块：
-- `ruoyi-common-chat`（请求 DTO）
-- `ruoyi-chat`（聊天编排与流式输出封装）
+效果：
+- 前端可独立渲染思考流；
+- 外部 handler 场景下仍能同步拿到 thinking 片段。
 
-兼容性说明：
-- 默认 `enableMcpTools=false`，不改变现有普通聊天默认路径；
-- 仅在显式开启时启用工具增强路径；
-- SSE 仍保留原 `content/done/error`，新增 `reasoning` 事件为增量能力。
+## 四、测试改动
+新增单元测试：
+- `ruoyi-modules/ruoyi-chat/src/test/java/org/ruoyi/common/chat/domain/dto/request/ChatRequestMcpToolsTest.java`
+  - 验证 `enableMcpTools` 默认值与开关行为；
+- `ruoyi-modules/ruoyi-chat/src/test/java/org/ruoyi/observability/OutputChannelTest.java`
+  - 验证 `OutputChannel` 的顺序消费、完成态与错误传播行为。
 
-## 四、关键行为说明
-### 1) 业务系统数据打通路径
-- 场景：用户问“我今天有多少个任务”；
-- 开启 `enableMcpTools` 后，助手可调用已启用的 MCP 工具和内置工具（如 SQL 查询工具）进行数据检索再回答。
-
-### 2) Thinking 前端展示
-- 模型返回思考片段时，后端会发送 `reasoning` SSE 事件；
-- 前端可单独渲染 reasoning 区域，实现“推理过程可见”体验。
-
-## 五、验证情况
+## 五、验证结果
 已执行：
-- `git diff --check` ✅（无冲突标记/无空白错误）
+- `git diff --check` ✅（无空白错误/无冲突标记）
 
-未执行（环境限制）：
-- `mvn ... compile` ❌
-  - 原因：当前环境缺少 Maven 可执行文件（`mvn: command not found`）。
+受环境限制未执行：
+- Maven 编译与单测命令（当前环境缺少 `mvn`）
+  - `mvn: command not found`
 
-建议在 CI 或具备 Maven 的环境补充：
+建议在 CI 或本地具备 Maven 后执行：
+- `mvn -pl ruoyi-modules/ruoyi-chat -am test`
 - `mvn -pl ruoyi-common/ruoyi-common-chat,ruoyi-modules/ruoyi-chat -am -DskipTests compile`
-- 针对 `/chat/send` 的 SSE 集成联调（含 `enableMcpTools` 开关、`reasoning` 事件断言）。
 
-## 六、风险与回滚
-### 风险
-- 工具增强模式依赖外部工具可用性，工具异常会导致回答降级或报错；
-- 前端若未消费 `reasoning` 事件，不影响主回答，但无法展示思考过程。
+## 六、兼容性说明
+- 默认 `enableMcpTools=false`，原普通聊天路径不变；
+- `reasoning` 事件为增量能力，不影响已有 `content/done/error` 消费方；
+- 工具不可用时有明确错误提示和收尾，不会悬挂连接。
 
-### 回滚策略
-- 代码级回滚：回退本 PR 提交即可恢复到原行为；
-- 运行级兜底：不开启 `enableMcpTools` 时仍使用原有聊天流程。
+## 七、风险与回滚
+风险：
+- 工具模式依赖外部工具可用性和权限配置；
+- 前端如未消费 `reasoning` 事件，只会缺少思考展示，不影响主回答流。
 
-## 七、涉及文件清单
+回滚：
+- 回退本 PR 代码即可恢复原行为；
+- 或运行时保持 `enableMcpTools=false` 作为快速兜底。
+
+## 八、涉及文件
 - `ruoyi-common/ruoyi-common-chat/src/main/java/org/ruoyi/common/chat/domain/dto/request/ChatRequest.java`
 - `ruoyi-modules/ruoyi-chat/src/main/java/org/ruoyi/service/chat/impl/ChatServiceFacade.java`
 - `ruoyi-modules/ruoyi-chat/src/main/java/org/ruoyi/observability/StreamingOutputWrapper.java`
+- `ruoyi-modules/ruoyi-chat/src/test/java/org/ruoyi/common/chat/domain/dto/request/ChatRequestMcpToolsTest.java`
+- `ruoyi-modules/ruoyi-chat/src/test/java/org/ruoyi/observability/OutputChannelTest.java`
